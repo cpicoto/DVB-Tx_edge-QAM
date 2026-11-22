@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Imported by Tezuka U-Boot on SD boot; never use persisted Fishball/RF variables.
+mode=1r1t
+attr_name=compatible
+attr_val=ad9361
+ad936x_ext_refclk=40000000
+refclk_source=internal
+bitstream_image=system_top.bin
+kernel_image=uImage
+devicetree_image=devicetree.dtb
+ramdisk_image=uramdisk.image.xz
+uenvcmd=echo Booting LibreSDR edgeQAM v1; if fatload mmc 0 0x0f000000 system_top.bin && fpga load 0 0x0f000000 ${filesize} && fatload mmc 0 0x03000000 uImage && fatload mmc 0 0x02000000 devicetree.dtb && fatload mmc 0 0x04000000 uramdisk.image.xz; then fdt addr 0x02000000; fdt resize; fdt rm /amba/spi@e0006000/ad9361-phy@0 adi,2rx-2tx-mode-enable; fdt set /fpga-axi/cf-ad9361-dds-core-lpc@79024000 compatible adi,axi-ad9364-dds-6.00.a; setenv bootargs console=ttyPS0,115200 maxcpus=2 root=/dev/ram0 rootfstype=ramfs rw clk_ignore_unused; bootm 0x03000000 0x04000000 0x02000000; fi; echo edgeQAM SD boot failed - refusing fallback firmware; reset

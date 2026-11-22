@@ -1,0 +1,19 @@
+{
+  "maia": {
+    "url": "https://github.com/F5OEO/maia-sdr.git",
+    "commit": "ba62a78084d1d7f4465ddde25a23a75bcf8c6f2d",
+    "branch": "refactor"
+  },
+  "firmware": {
+    "url": "https://github.com/F5OEO/tezuka_fw.git",
+    "commit": "49403b9899903cd740a6e0286af5f82098d51023"
+  },
+  "adi_hdl": "cf81ab15cdb1376982b53827a9aa3db01297eecc",
+  "reference": {
+    "url": "https://github.com/TrusterBSW/DVB-Tx.git",
+    "commit": "0f48e124f6c6870d9cf365a4f8b52c5efc9cb9e2"
+  },
+  "v1_baseline": "9e2a797a03fff36f1d8f5bc889258aaca0b6c01b",
+  "part": "xc7z020clg400-2",
+  "xilinx_version": "2023.1"
+}

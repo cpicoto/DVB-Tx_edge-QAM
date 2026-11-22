@@ -22,6 +22,11 @@
 
 ---
 
+> **LibreSDR v1 source port:** see [docs/LIBRESDR_PORT.md](docs/LIBRESDR_PORT.md)
+> for the separate single-multiplex XC7Z020/AD9361 target, pinned build recipe,
+> validation status and outstanding board-wiring work. The Fishball release
+> below must not be installed on LibreSDR.
+
 DVB-Tx_edge-QAM turns a HamGeek Fishball (Zynq XC7Z010 + AD9363, gigabit Ethernet) into a small
 **edgeQAM**: the PC only sends transport streams over UDP, and the board does everything else in its
 FPGA, from energy dispersal to the OFDM symbols, then transmits up to four adjacent DVB-T channels.
