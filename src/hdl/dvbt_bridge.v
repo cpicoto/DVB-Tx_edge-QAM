@@ -14,7 +14,9 @@
 //                          3 {sync errors + words dropped to resync [15:0], IFFT overflows[15:0]}
 `timescale 1ns/1ps
 
-module dvbt_bridge (
+module dvbt_bridge #(
+  parameter SINGLE_MUX = 0
+) (
   (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_clk CLK" *)
   (* X_INTERFACE_PARAMETER = "ASSOCIATED_RESET s_resetn" *)
   input             s_clk,
@@ -71,6 +73,10 @@ module dvbt_bridge (
   (* ASYNC_REG = "TRUE" *) reg [1:0] en_d_m = 2'b0;
   wire en_d = en_d_m[1];
   always @(posedge d_clk) en_d_m <= {en_d_m[0], en_s};
+  // v1 has no HLS control stream: mute IQ without stopping the DMA/HLS pipeline.
+  (* ASYNC_REG = "TRUE" *) reg [1:0] mute_d_m = 2'b11;
+  always @(posedge d_clk) mute_d_m <= {mute_d_m[0], gpio_out[8]};
+  wire muted = SINGLE_MUX && mute_d_m[1];
 
   // ---------------------------------------------------------------- TS FIFO d_clk -> s_clk
   wire        tsf_full, tsf_empty, tsf_wr_busy, tsf_rd_busy;
@@ -164,8 +170,8 @@ module dvbt_bridge (
         unf_cnt <= unf_cnt + 1'b1;
     end
     if (en_d) begin
-      dac_d0 <= iqf_rd ? iqf_dout[15:0] : 16'd0;
-      dac_d1 <= iqf_rd ? iqf_dout[31:16] : 16'd0;
+      dac_d0 <= iqf_rd && !muted ? iqf_dout[15:0] : 16'd0;
+      dac_d1 <= iqf_rd && !muted ? iqf_dout[31:16] : 16'd0;
       dac_d2 <= 16'd0;
       dac_d3 <= 16'd0;
       dac_valid <= dac_req;

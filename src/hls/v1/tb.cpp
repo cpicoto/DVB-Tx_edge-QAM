@@ -1,6 +1,8 @@
 /* C simulation: dvbt_mod against the dvbtx reference (tests/dvbt_ref.c, cf32 at 9.142857 MS/s).
  * usage: csim argv: in.ts ref.cf32 nsym [starve_from starve_len]
- * Per symbol, least-squares gain fit then SNR = |g ref|^2 / |out - g ref|^2. */
+ * Per symbol, least-squares gain fit then SNR = |g ref|^2 / |out - g ref|^2.
+ * Optional argv[4]: baseline v1 cs16, compared byte-for-byte including startup.
+ * The floating-reference SNR check alone is NOT proof of bit-exact IQ. */
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,13 +19,26 @@ int main(int argc, char **argv)
         printf("cannot open %s or %s\n", tsn, refn);
         return 1;
     }
+    FILE *gold = argc > 4 ? fopen(argv[4], "rb") : NULL;
+    if (argc > 4 && !gold) {
+        fprintf(stderr, "cannot open baseline %s\n", argv[4]);
+        return 1;
+    }
+    if (nsym < 3) {
+        fprintf(stderr, "at least 3 symbols required\n");
+        return 1;
+    }
     hls::stream<ap_uint<32> > ts_in, iq_out;
     hls::stream<ap_uint<16> > st_ts, st_fft;
     FILE *of = fopen("hls_out.cs16", "wb");
+    if (!of) {
+        perror("hls_out.cs16");
+        return 1;
+    }
 
     long fed = 0;
     double worst = 1e9, sum = 0, peak = 0, pw = 0;
-    int ovf = 0, nulls = 0, serr = 0, bad = 0;
+    int ovf = 0, nulls = 0, serr = 0, bad = 0, mismatches = 0;
     std::vector<float> ref(2 * DVBT_NSYM_OUT);
     for (int s = 0; s < nsym; s++) {
         /* keep at least 8 packets waiting so that no null packet is inserted */
@@ -64,7 +79,18 @@ int main(int argc, char **argv)
                 peak = m;
             pw += oi[i] * oi[i] + oq[i] * oq[i];
         }
-        fwrite(buf, sizeof buf, 1, of);
+        if (fwrite(buf, sizeof buf, 1, of) != 1)
+            return 1;
+        if (gold) {
+            short expected[2 * DVBT_NSYM_OUT];
+            if (fread(expected, sizeof expected, 1, gold) != 1) {
+                fprintf(stderr, "baseline too short at symbol %d\n", s);
+                return 1;
+            }
+            for (int i = 0; i < 2 * DVBT_NSYM_OUT; i++)
+                if (buf[i] != expected[i])
+                    mismatches++;
+        }
         /* g = <out, ref> / <ref, ref> (complex) */
         double nr = 0, ni = 0, d = 0;
         for (int i = 0; i < DVBT_NSYM_OUT; i++) {
@@ -72,6 +98,10 @@ int main(int argc, char **argv)
             nr += oi[i] * ri + oq[i] * rq;
             ni += oq[i] * ri - oi[i] * rq;
             d += ri * ri + rq * rq;
+        }
+        if (!std::isfinite(d) || d <= 0) {
+            fprintf(stderr, "invalid reference power at symbol %d\n", s);
+            return 1;
         }
         double gr = nr / d, gi = ni / d, es = 0, ee = 0;
         for (int i = 0; i < DVBT_NSYM_OUT; i++) {
@@ -83,7 +113,7 @@ int main(int argc, char **argv)
         double snr = 10 * log10(es / (ee + 1e-30));
         if (s >= 2 && snr < worst)
             worst = snr;
-        if (s >= 2 && snr < 40)
+        if (s >= 2 && (!std::isfinite(snr) || snr < 40))
             bad++;
         sum += snr;
         if (s < 3 || snr < 40)
@@ -94,5 +124,17 @@ int main(int argc, char **argv)
            " (%.1f dB PAPR margin), IFFT overflows %d, null packets %d, sync errors %d, %ld packets fed\n",
            nsym, sum / nsym, worst, bad, rms, peak, 20 * log10(1 / rms), ovf, nulls, serr, fed);
     fclose(of);
-    return (bad == 0 && ovf == 0 && nulls == 0) ? 0 : 1;
+    fclose(tf);
+    fclose(rf);
+    if (gold) {
+        if (fgetc(gold) != EOF) {
+            fprintf(stderr, "baseline has trailing data\n");
+            return 1;
+        }
+        fclose(gold);
+        printf("BIT_EXACT: %d mismatched I/Q components (startup included)\n", mismatches);
+    } else {
+        printf("Floating-reference check only; bit-exact comparison not requested\n");
+    }
+    return (bad == 0 && ovf == 0 && nulls == 0 && serr == 0 && mismatches == 0) ? 0 : 1;
 }

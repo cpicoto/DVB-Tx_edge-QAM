@@ -36,9 +36,9 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include "dvbt_tx_profile.h"
 
 #define TS 188
-#define MAXMUX 4
 #define RING (1 << 13)             /* packets per multiplex input */
 #define PKTS_PER_BUF 344           /* multiple of 8: whole rounds, 8-byte aligned */
 #define DAC_GPIO_BASE 0x79024000u
@@ -47,7 +47,8 @@
 #define MUX_RATE (64e6 / 7.0)      /* sample rate of one multiplex */
 #define TS_RATE 31668449.2
 
-static volatile int stop;
+static volatile sig_atomic_t stop;
+static _Atomic int worker_error;
 static volatile uint32_t *dacregs;
 
 typedef struct {
@@ -67,7 +68,7 @@ static pthread_mutex_t api_lock = PTHREAD_MUTEX_INITIALIZER;
 static long long g_lo, g_lo_req, g_lo_cfg;   /* read back, requested, configured */
 static double g_att, g_att_req;
 static uint32_t g_mute, g_mute_req;
-static int g_change;                 /* bit 0 freq, 1 att, 2 mute */
+static _Atomic int g_change;         /* bit 0 freq, 1 att, 2 mute */
 static int g_set_err;                /* last /set refused by the AD9363 (asleep, out of range) */
 static const char *g_conf = "/boot/edgeqam.conf";
 static struct timespec g_t_start;    /* uptime_s in /status: lets a client detect a restart */
@@ -116,12 +117,20 @@ static void *udp_thread(void *arg)
         port = atoi(s);
     }
     int fd = socket(AF_INET, SOCK_DGRAM, 0), one = 1, rcv = 4 << 20;
+    if (fd < 0) {
+        perror("UDP socket");
+        worker_error = 1;
+        stop = 1;
+        return NULL;
+    }
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {
         perror("bind");
+        worker_error = 1;
+        close(fd);
         stop = 1;
         return NULL;
     }
@@ -129,8 +138,13 @@ static void *udp_thread(void *arg)
         struct ip_mreq m = { 0 };
         m.imr_multiaddr.s_addr = inet_addr(grp);
         m.imr_interface.s_addr = htonl(INADDR_ANY);
-        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) < 0)
+        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) < 0) {
             perror("IP_ADD_MEMBERSHIP");
+            worker_error = 1;
+            close(fd);
+            stop = 1;
+            return NULL;
+        }
     }
     struct timeval tv = { 0, 200000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -148,7 +162,17 @@ static void *udp_thread(void *arg)
             msgs[k].msg_hdr.msg_iovlen = 1;
         }
         int got = recvmmsg(fd, msgs, NMSG, MSG_WAITFORONE, NULL);
+        if (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            perror("UDP receive");
+            worker_error = 1;
+            stop = 1;
+            break;
+        }
         for (int k = 0; k < got; k++) {
+            if (msgs[k].msg_hdr.msg_flags & MSG_TRUNC) {
+                atomic_fetch_add(&p->drop, 1);
+                continue;
+            }
             uint8_t *b = bufs[k];
             size_t n = msgs[k].msg_len, off = 0;
             if (n % TS == 12 && b[0] == 0x80)     /* RTP header */
@@ -169,6 +193,7 @@ static void *file_thread(void *arg)
         FILE *f = path ? fopen(path, "rb") : stdin;
         if (!f) {
             perror(path);
+            worker_error = 1;
             stop = 1;
             break;
         }
@@ -218,7 +243,7 @@ static double read_num(const char *path, double scale)
 }
 
 /* rewrite KEY=value lines of the configuration file (others kept) */
-static void conf_save(void)
+static int conf_save(void)
 {
     char tmp[256], line[512];
     snprintf(tmp, sizeof tmp, "%s.tmp", g_conf);
@@ -226,7 +251,8 @@ static void conf_save(void)
     if (!out) {
         if (in_f)
             fclose(in_f);
-        return;
+        perror("save configuration");
+        return -1;
     }
     int done_f = 0, done_a = 0, done_m = 0;
     while (in_f && fgets(line, sizeof line, in_f)) {
@@ -251,9 +277,16 @@ static void conf_save(void)
         fprintf(out, "DISABLE=%u\n", g_mute);
     if (in_f)
         fclose(in_f);
-    fclose(out);
-    rename(tmp, g_conf);
+    int failed = ferror(out);
+    if (fclose(out) != 0)
+        failed = 1;
+    if (failed || rename(tmp, g_conf) != 0) {
+        perror("save configuration");
+        unlink(tmp);
+        return -1;
+    }
     if (system("sync") != 0) { }
+    return 0;
 }
 
 static int qparam(const char *q, const char *key, char *val, size_t n)
@@ -281,6 +314,9 @@ static void *http_thread(void *arg)
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(ls, (struct sockaddr *)&a, sizeof a) < 0 || listen(ls, 4) < 0) {
         perror("http bind");
+        close(ls);
+        worker_error = 1;
+        stop = 1;
         return NULL;
     }
     struct timeval tv = { 0, 300000 };
@@ -328,33 +364,47 @@ static void *http_thread(void *arg)
             int any = 0, save = 0;
             pthread_mutex_lock(&api_lock);
             if (q && qparam(q, "freq", v, sizeof v)) {
-                long long f = (long long)atof(v);
-                if (f >= 70000000LL && f <= 6000000000LL) {
+                long long f;
+                if (parse_integer(v, 70000000LL, 6000000000LL, &f) == 0) {
                     g_lo_req = f + (long long)(nmux - 1) * 4000000LL;   /* f = multiplex 1 */
                     g_change |= 1;
                     any = 1;
+                } else {
+                    code = 400;
                 }
             }
             if (q && qparam(q, "att", v, sizeof v)) {
-                double at = atof(v);
-                if (at >= 0 && at <= 89.75) {
+                double at;
+                if (parse_attenuation(v, &at) == 0) {
                     g_att_req = at;
                     g_change |= 2;
                     any = 1;
+                } else {
+                    code = 400;
                 }
             }
             if (q && (qparam(q, "disable", v, sizeof v) || qparam(q, "mute", v, sizeof v))) {
-                g_mute_req = (uint32_t)strtoul(v, NULL, 0) & ((1u << nmux) - 1);
-                g_change |= 4;
-                any = 1;
+                uint32_t requested;
+                if (parse_mute(v, nmux, &requested) == 0) {
+                    g_mute_req = requested;
+                    g_change |= 4;
+                    any = 1;
+                } else {
+                    code = 400;
+                }
             }
             if (q && qparam(q, "save", v, sizeof v) && atoi(v))
                 save = 1;
             pthread_mutex_unlock(&api_lock);
             for (int k = 0; k < 30 && g_change; k++)     /* applied by the main loop */
                 usleep(20000);
-            if (save)
-                conf_save();
+            pthread_mutex_lock(&api_lock);
+            if (g_change || g_set_err || code != 200)
+                any = 0;
+            if (save && (!any || conf_save() != 0)) {
+                save = 0;
+                code = 400;
+            }
             if (g_set_err)
                 any = 0;            /* the AD9363 refused (e.g. asleep): report an error */
             len = snprintf(body, sizeof body, "{\"ok\":%s,\"freq_mux1_hz\":%lld,\"lo_hz\":%lld,\"attenuation_db\":%.2f,"
@@ -362,6 +412,7 @@ static void *http_thread(void *arg)
                            save ? "true" : "false");
             if (!any)
                 code = 400;
+            pthread_mutex_unlock(&api_lock);
         } else {
             code = 404;
             len = snprintf(body, sizeof body, "{\"error\":\"GET /status or /set?freq=HZ&att=DB&disable=MASK&save=1\"}\n");
@@ -380,44 +431,87 @@ static void *http_thread(void *arg)
 
 int main(int argc, char **argv)
 {
-    long long lo = 0;
+    long long lo = DEFAULT_FREQUENCY;
     double att = 30;
     int verbose = 0, opt, http_port = 8080;
+    const char *default_input_spec = DEFAULT_INPUT;
     long mute_opt = -1;
     while ((opt = getopt(argc, argv, "n:f:a:p:c:d:m:v")) != -1) {
+        long long parsed_option;
         switch (opt) {
         case 'd':
-        case 'm': mute_opt = strtol(optarg, NULL, 0); break;
-        case 'p': http_port = atoi(optarg); break;
+        case 'm': {
+            uint32_t parsed;
+            if (parse_mute(optarg, MAXMUX, &parsed) < 0)
+                goto usage;
+            mute_opt = parsed;
+            break;
+        }
+        case 'p':
+            if (parse_integer(optarg, 0, 65535, &parsed_option) < 0)
+                goto usage;
+            http_port = (int)parsed_option;
+            break;
         case 'c': g_conf = optarg; break;
-        case 'n': nmux = atoi(optarg); break;
-        case 'f': lo = (long long)atof(optarg); break;    /* multiplex 1, LO computed below */
-        case 'a': att = atof(optarg); break;
+        case 'n':
+            if (parse_integer(optarg, 1, MAXMUX, &parsed_option) < 0)
+                goto usage;
+            nmux = (int)parsed_option;
+            break;
+        case 'f':
+            if (parse_integer(optarg, 70000000LL, 6000000000LL, &lo) < 0)
+                goto usage;
+            break;
+        case 'a':
+            if (parse_attenuation(optarg, &att) < 0)
+                goto usage;
+            break;
         case 'v': verbose = 1; break;
         default: goto usage;
         }
     }
-    if ((nmux != 1 && nmux != 2 && nmux != 4) || lo <= 0 || optind >= argc) {
+    if (!valid_nmux(nmux) || lo < 70000000LL || lo > 6000000000LL ||
+        att < 0 || att > 89.75 || http_port < 0 || http_port > 65535 ||
+        (mute_opt >= 0 && (unsigned long)mute_opt >= (1u << nmux)) ||
+        (!default_input_spec && optind >= argc) || argc - optind > nmux) {
 usage:
+#ifdef LIBRESDR_V1
+        fprintf(stderr, "usage: dvbt_tx [-n 1] [-f FREQ_HZ] [-a ATT_DB] [-p HTTP_PORT] [-c CONF] [-d 0|1] [-v] [IN0]\n"
+                        "  LibreSDR v1: exactly one mux; default IN0=udp:1001, FREQ=474000000\n");
+#else
         fprintf(stderr, "usage: dvbt_tx -n 1|2|4 -f FREQ_MUX1_HZ [-a ATT_DB] [-p HTTP_PORT] [-c CONF] [-d DISABLE_MASK] [-v] IN0 [IN1 ...]\n"
                         "  IN = udp:PORT | udp:GROUP:PORT | file:PATH | -\n");
+#endif
         return 1;
     }
     lo += (long long)(nmux - 1) * 4000000LL;          /* LO in the middle of the N channels */
     int nin = argc - optind;
-    if (nin > nmux)
-        nin = nmux;
+    if (!nin && default_input_spec)
+        nin = 1;
     for (int i = 0; i < nmux; i++) {
         in[i].ring = malloc((size_t)RING * TS);
+        if (!in[i].ring) {
+            perror("input ring");
+            return 1;
+        }
         if (i < nin) {
-            snprintf(in[i].spec, sizeof in[i].spec, "%s", argv[optind + i]);
+            const char *spec = optind + i < argc ? argv[optind + i] : default_input_spec;
+            if (strlen(spec) >= sizeof in[i].spec || input_port(spec) < 0) {
+                fprintf(stderr, "invalid input: %s\n", spec);
+                return 1;
+            }
+            snprintf(in[i].spec, sizeof in[i].spec, "%s", spec);
             int isudp = !strncmp(in[i].spec, "udp:", 4);
             in[i].file = !isudp;
             if (!isudp && strcmp(in[i].spec, "-") && strncmp(in[i].spec, "file:", 5)) {
                 fprintf(stderr, "bad input %s\n", in[i].spec);
                 return 1;
             }
-            pthread_create(&in[i].th, NULL, isudp ? udp_thread : file_thread, &in[i]);
+            int err = pthread_create(&in[i].th, NULL, isudp ? udp_thread : file_thread, &in[i]);
+            if (err) {
+                fprintf(stderr, "input thread: %s\n", strerror(err));
+                return 1;
+            }
         } else {
             strcpy(in[i].spec, "(no input: disabled)");
         }
@@ -451,13 +545,23 @@ usage:
     long long fs = (long long)(MUX_RATE * nmux + 0.5);
     struct iio_channel *txv = iio_device_find_channel(phy, "voltage0", true);
     struct iio_channel *txlo = iio_device_find_channel(phy, "altvoltage1", true);
-    iio_channel_attr_write_double(txv, "hardwaregain", -att);
-    wr_attr_ll(txv, "sampling_frequency", fs);
-    wr_attr_ll(txv, "rf_bandwidth", (long long)(8.5e6 * nmux));
-    wr_attr_ll(txlo, "frequency", lo);
+    if (!txv || !txlo) {
+        fprintf(stderr, "AD9361 TX channels not found\n");
+        return 1;
+    }
+    if (iio_channel_attr_write_double(txv, "hardwaregain", -89.75) < 0 ||
+        wr_attr_ll(txv, "sampling_frequency", fs) < 0 ||
+        wr_attr_ll(txv, "rf_bandwidth", (long long)(8.5e6 * nmux)) < 0 ||
+        wr_attr_ll(txlo, "frequency", lo) < 0) {
+        fprintf(stderr, "radio configuration failed; TX remains attenuated\n");
+        return 1;
+    }
     long long fs_rd = 0, lo_rd = 0;
-    iio_channel_attr_read_longlong(txv, "sampling_frequency", &fs_rd);
-    iio_channel_attr_read_longlong(txlo, "frequency", &lo_rd);
+    if (iio_channel_attr_read_longlong(txv, "sampling_frequency", &fs_rd) < 0 ||
+        iio_channel_attr_read_longlong(txlo, "frequency", &lo_rd) < 0 || fs_rd <= 0) {
+        fprintf(stderr, "cannot read back radio configuration\n");
+        return 1;
+    }
     fprintf(stderr, "dvbt_tx: %d multiplex(es), LO %.6f MHz, %lld S/s (asked %lld), attenuation %.2f dB\n",
             nmux, lo_rd / 1e6, fs_rd, fs, att);
     for (int i = 0; i < nmux; i++)
@@ -480,11 +584,22 @@ usage:
     g_st.fs = fs_rd;
     clock_gettime(CLOCK_MONOTONIC, &g_t_start);
     pthread_t hth;
-    if (http_port > 0)
-        pthread_create(&hth, NULL, http_thread, (void *)(intptr_t)http_port);
+    if (http_port > 0) {
+        int err = pthread_create(&hth, NULL, http_thread, (void *)(intptr_t)http_port);
+        if (err) {
+            fprintf(stderr, "HTTP thread: %s\n", strerror(err));
+            worker_error = 1;
+            stop = 1;
+        }
+    }
 
     struct iio_channel *c0 = iio_device_find_channel(dds, "voltage0", true);
     struct iio_channel *c1 = iio_device_find_channel(dds, "voltage1", true);
+    if (!c0 || !c1) {
+        fprintf(stderr, "TX DMA I/Q channels not found\n");
+        dacregs[GPIO_OUT / 4] &= ~0xF0Eu;
+        return 1;
+    }
     iio_channel_enable(c0);
     iio_channel_enable(c1);
     iio_device_set_kernel_buffers_count(dds, 4);
@@ -493,6 +608,12 @@ usage:
     if (!buf) {
         fprintf(stderr, "cannot create TX buffer: %s\n", strerror(errno));
         stop = 1;
+    }
+    int tx_error = !buf;
+    if (buf && !stop && iio_channel_attr_write_double(txv, "hardwaregain", -att) < 0) {
+        fprintf(stderr, "cannot apply TX attenuation\n");
+        stop = 1;
+        tx_error = 1;
     }
     static const uint8_t nullpkt_hdr[4] = { 0x47, 0x1F, 0xFF, 0x10 };
     struct timespec t0, t;
@@ -516,6 +637,7 @@ usage:
         ssize_t r = iio_buffer_push(buf);
         if (r < 0) {
             fprintf(stderr, "push: %s\n", strerror((int)-r));
+            tx_error = 1;
             break;
         }
         bufs++;
@@ -555,18 +677,26 @@ usage:
             pthread_mutex_lock(&api_lock);
             g_set_err = 0;
             if (g_change & 1) {
-                if (wr_attr_ll(txlo, "frequency", g_lo_req) < 0)
+                long long applied;
+                if (wr_attr_ll(txlo, "frequency", g_lo_req) < 0 ||
+                    iio_channel_attr_read_longlong(txlo, "frequency", &applied) < 0) {
                     g_set_err = 1;
-                iio_channel_attr_read_longlong(txlo, "frequency", &g_lo);
-                lo = g_lo_req;
-                g_lo_cfg = lo - (long long)(nmux - 1) * 4000000LL;
+                    fprintf(stderr, "api: frequency change failed\n");
+                } else {
+                    g_lo = applied;
+                    lo = g_lo_req;
+                    g_lo_cfg = lo - (long long)(nmux - 1) * 4000000LL;
+                }
                 fprintf(stderr, "api: LO %.6f MHz\n", g_lo / 1e6);
             }
             if (g_change & 2) {
-                att = g_att_req;
-                if (iio_channel_attr_write_double(txv, "hardwaregain", -att) < 0)
+                if (iio_channel_attr_write_double(txv, "hardwaregain", -g_att_req) < 0) {
                     g_set_err = 1;
-                g_att = att;
+                    fprintf(stderr, "api: attenuation change failed\n");
+                } else {
+                    att = g_att_req;
+                    g_att = att;
+                }
                 fprintf(stderr, "api: attenuation %.2f dB\n", att);
             }
             if (g_change & 4) {
@@ -624,5 +754,5 @@ usage:
     if (system("eco reprise >/dev/null 2>&1") != 0)
         fprintf(stderr, "(eco reprise failed, ignored)\n");
     fprintf(stderr, "dvbt_tx: stopped, modulator off, TX attenuation 89.75 dB\n");
-    return 0;
+    return tx_error || worker_error ? 1 : 0;
 }

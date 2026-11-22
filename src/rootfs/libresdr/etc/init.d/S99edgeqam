@@ -1,0 +1,71 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Dedicated image: no competing Maia/NCO/eco/SDR network transmitter services.
+set -eu
+CONF=/boot/edgeqam.conf
+PIDF=/var/run/edgeqam.pid
+ENABLE=0 NMUX=1 FREQ=474000000 ATT=89.75 DISABLE=0 INPUT0=udp:1001 HTTP_PORT=8080
+if [ -r "$CONF" ]; then
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        value=$(printf '%s' "$value" | tr -d '\r')
+        case "$key" in
+            ENABLE) ENABLE=$value ;; NMUX) NMUX=$value ;;
+            FREQ) FREQ=$value ;; ATT) ATT=$value ;; DISABLE) DISABLE=$value ;;
+            INPUT0) INPUT0=$value ;; HTTP_PORT) HTTP_PORT=$value ;;
+            ''|\#*) ;;
+            *) echo "edgeqam: unsupported setting $key" >&2; exit 1 ;;
+        esac
+    done < "$CONF"
+fi
+[ "$NMUX" = 1 ] || { echo "edgeqam: LibreSDR supports only NMUX=1" >&2; exit 1; }
+case "$ENABLE:$DISABLE" in 0:0|0:1|1:0|1:1) ;; *) echo "edgeqam: invalid ENABLE/DISABLE" >&2; exit 1 ;; esac
+
+attenuate() {
+    found=0
+    for d in /sys/bus/iio/devices/iio:device*; do
+        [ -r "$d/name" ] || continue
+        if [ "$(cat "$d/name")" = ad9361-phy ]; then
+            echo -89.75 > "$d/out_voltage0_hardwaregain"
+            [ ! -e "$d/out_voltage1_hardwaregain" ] || echo -89.75 > "$d/out_voltage1_hardwaregain"
+            found=1
+        fi
+    done
+    [ "$found" = 1 ] || { echo "edgeqam: AD9361 not found" >&2; return 1; }
+}
+running() { [ -r "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+stop_tx() {
+    attenuate
+    if running; then
+        pid=$(cat "$PIDF")
+        start-stop-daemon -K -p "$PIDF" -s TERM
+        count=0
+        while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 5 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "edgeqam: DMA shutdown stalled; terminating PID $pid" >&2
+            kill -KILL "$pid"
+        fi
+    fi
+    rm -f "$PIDF"
+}
+case "${1:-}" in
+    start)
+        attenuate
+        [ "$ENABLE" = 1 ] || { echo "edgeqam: disabled in $CONF"; exit 0; }
+        running && exit 0
+        start-stop-daemon -S -b -m -p "$PIDF" -x /usr/sbin/dvbt_tx -- \
+            -n 1 -f "$FREQ" -a "$ATT" -d "$DISABLE" -p "$HTTP_PORT" -c "$CONF" "$INPUT0"
+        sleep 1
+        if ! running; then
+            echo "edgeqam: dvbt_tx failed to start" >&2
+            attenuate
+            exit 1
+        fi
+        ;;
+    stop) stop_tx ;;
+    restart) stop_tx; exec "$0" start ;;
+    status) wget -q -O - "http://127.0.0.1:$HTTP_PORT/status" ;;
+    *) echo "usage: $0 start|stop|restart|status" >&2; exit 1 ;;
+esac
